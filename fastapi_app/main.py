@@ -136,6 +136,8 @@ class SessionManager:
         self.pc_api = XHS_Apis()
         self.creator_login_api = XHSCreatorLoginApi()
         self.creator_api = XHS_Creator_Apis()
+        # 存储二维码检测结果 {qr_id: {"status": str, "result": dict, "done": bool}}
+        self.qrcode_results: Dict[str, Dict[str, Any]] = {}
 
     def create_session(self, session_id: str) -> Dict[str, Any]:
         """创建新会话"""
@@ -189,11 +191,59 @@ async def health_check():
 
 # ==================== 登录认证API ====================
 
+async def _check_qrcode_background(qr_id: str, code: str, cookies: Dict[str, str]):
+    """后台任务：持续检测二维码状态，直到确认扫描结果"""
+    session_manager.qrcode_results[qr_id] = {"status": "pending", "result": None, "done": False}
+    try:
+        # 持续检测直到有结果（最多检测120次，间隔5秒，共10分钟）
+        for _ in range(120):
+            await asyncio.sleep(5)
+            success, msg, updated_cookies = session_manager.pc_login_api.check_qrcode_status(
+                qr_id, code, cookies
+            )
+
+            if success and msg == "二维码已扫描，请确认登录":
+                session_manager.qrcode_results[qr_id] = {
+                    "status": "scanned",
+                    "result": {"cookies": updated_cookies},
+                    "done": False
+                }
+            elif success and msg == "二维码已确认，请稍后":
+                # 登录成功
+                user_success, user_info, final_cookies = session_manager.pc_login_api.get_user_info(updated_cookies)
+                cookies_str = session_manager.pc_login_api.cookies_to_str(final_cookies)
+                session_manager.qrcode_results[qr_id] = {
+                    "status": "confirmed",
+                    "result": {
+                        "user_info": user_info if user_success else None,
+                        "cookies": final_cookies,
+                        "cookies_str": cookies_str
+                    },
+                    "done": True
+                }
+                break
+            elif msg == "二维码已失效":
+                session_manager.qrcode_results[qr_id] = {
+                    "status": "expired",
+                    "result": None,
+                    "done": True
+                }
+                break
+            elif msg == "二维码未失效，请继续等待":
+                # 继续等待
+                continue
+    except Exception as e:
+        session_manager.qrcode_results[qr_id] = {
+            "status": "error",
+            "result": str(e),
+            "done": True
+        }
+
 @app.post("/auth/qrcode/init", response_model=ResponseModel)
-async def init_qrcode_login():
+async def init_qrcode_login(background_tasks: BackgroundTasks):
     """
     初始化二维码登录
-    生成初始cookies和二维码
+    生成初始cookies和二维码，启动后台检测
     """
     try:
         # 生成初始cookies
@@ -203,12 +253,17 @@ async def init_qrcode_login():
         success, msg, qr_data = session_manager.pc_login_api.generate_qrcode(cookies)
 
         if success:
+            qr_id = qr_data["qr_id"]
+            code = qr_data["code"]
+            # 启动后台任务检测二维码状态
+            background_tasks.add_task(_check_qrcode_background, qr_id, code, qr_data["cookies"])
+
             return ResponseModel(
                 success=True,
-                message="二维码生成成功",
+                message="二维码生成成功，正在后台检测扫描状态",
                 data={
-                    "qr_id": qr_data["qr_id"],
-                    "code": qr_data["code"],
+                    "qr_id": qr_id,
+                    "code": code,
                     "qr_url": qr_data["qr_url"],
                     "cookies": qr_data["cookies"]
                 }
@@ -233,9 +288,41 @@ async def check_qrcode_status(
     cookies: Dict[str, str]
 ):
     """
-    检查二维码扫描状态
+    检查二维码扫描状态（从后台检测结果获取）
     """
     try:
+        # 优先从后台检测结果获取
+        if qr_id in session_manager.qrcode_results:
+            result = session_manager.qrcode_results[qr_id]
+            if result["done"]:
+                status = result["status"]
+                if status == "confirmed":
+                    return ResponseModel(
+                        success=True,
+                        message="登录成功",
+                        data=result["result"]
+                    )
+                elif status == "expired":
+                    return ResponseModel(
+                        success=False,
+                        message="二维码已失效",
+                        data=None
+                    )
+                elif status == "error":
+                    return ResponseModel(
+                        success=False,
+                        message=f"检测出错: {result['result']}",
+                        data=None
+                    )
+            else:
+                # 检测中
+                return ResponseModel(
+                    success=True,
+                    message=result["status"],
+                    data=result["result"]
+                )
+
+        # 如果没有后台结果，直接检查（兼容旧逻辑）
         success, msg, updated_cookies = session_manager.pc_login_api.check_qrcode_status(
             qr_id, code, cookies
         )

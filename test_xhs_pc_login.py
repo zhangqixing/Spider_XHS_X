@@ -7,7 +7,8 @@
 import sys
 from pathlib import Path
 
-project_root = Path(__file__).parent.parent.resolve()
+project_root = Path(__file__).parent.resolve()
+print(f"项目根路径: {project_root}")
 sys.path.insert(0, str(project_root))
 
 from apis.xhs_pc_login_apis import XHSLoginApi

@@ -17,7 +17,7 @@ import asyncio
 from datetime import datetime
 
 # 添加项目路径
-project_root = Path(__file__).parent.parent.parent.resolve() / "Splider_XHS"
+project_root = Path(__file__).parent.parent.resolve() 
 sys.path.insert(0, str(project_root))
 print(f"项目根路径已添加到sys.path: {project_root}")
 
@@ -59,6 +59,14 @@ class LoginRequest(BaseModel):
     login_type: str = Field(..., description="登录类型: qrcode(二维码) 或 phone(手机验证码)")
     phone: Optional[str] = Field(None, description="手机号(手机登录时需要)")
     zone: str = Field(default="86", description="区号，默认86")
+
+class QRCodeInitRequest(BaseModel):
+    """二维码登录初始化请求"""
+    session_name: Optional[str] = Field(None, description="自定义会话名，用于保存cookie。如不指定，登录成功后将使用用户ID作为会话名")
+
+class QRCodeCheckRequest(BaseModel):
+    """二维码状态检查请求"""
+    session_name: str = Field(..., description="会话名，用于查询对应的二维码状态")
 
 class QRCodeResponse(BaseModel):
     """二维码响应"""
@@ -128,6 +136,9 @@ class PublishNoteRequest(BaseModel):
 
 # ==================== 全局状态管理 ====================
 
+# Cookie文件路径
+COOKIE_FILE = Path(__file__).parent / "cookies.json"
+
 class SessionManager:
     """会话管理器"""
     def __init__(self):
@@ -138,6 +149,56 @@ class SessionManager:
         self.creator_api = XHS_Creator_Apis()
         # 存储二维码检测结果 {qr_id: {"status": str, "result": dict, "done": bool}}
         self.qrcode_results: Dict[str, Dict[str, Any]] = {}
+        # session_name 到 qr_id 的映射 {session_name: qr_id}
+        self.session_qr_map: Dict[str, str] = {}
+        # 持久化的cookie存储 {session_name: {"cookies": dict, "cookies_str": str, "user_info": dict, "updated_at": str}}
+        self.saved_cookies: Dict[str, Dict[str, Any]] = self._load_cookies()
+
+    def _load_cookies(self) -> Dict[str, Dict[str, Any]]:
+        """从文件加载cookie"""
+        if COOKIE_FILE.exists():
+            try:
+                with open(COOKIE_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    print(f"已从文件加载cookie，共 {len(data)} 个会话")
+                    return data
+            except Exception as e:
+                print(f"加载cookie文件失败: {e}")
+        return {}
+
+    def _save_cookies(self):
+        """保存cookie到文件"""
+        try:
+            with open(COOKIE_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.saved_cookies, f, ensure_ascii=False, indent=2)
+            print(f"Cookie已保存到文件: {COOKIE_FILE}")
+        except Exception as e:
+            print(f"保存cookie文件失败: {e}")
+
+    def save_session_cookie(self, session_name: str, cookies: Dict[str, str], 
+                           cookies_str: str, user_info: Optional[Dict] = None):
+        """保存会话cookie到持久化存储"""
+        self.saved_cookies[session_name] = {
+            "cookies": cookies,
+            "cookies_str": cookies_str,
+            "user_info": user_info,
+            "updated_at": datetime.now().isoformat()
+        }
+        self._save_cookies()
+
+    def get_session_cookie(self, session_name: str) -> Optional[Dict[str, Any]]:
+        """获取持久化的会话cookie"""
+        return self.saved_cookies.get(session_name)
+
+    def delete_session_cookie(self, session_name: str):
+        """删除持久化的会话cookie"""
+        if session_name in self.saved_cookies:
+            del self.saved_cookies[session_name]
+            self._save_cookies()
+
+    def list_saved_sessions(self) -> List[str]:
+        """列出所有已保存的会话"""
+        return list(self.saved_cookies.keys())
 
     def create_session(self, session_id: str) -> Dict[str, Any]:
         """创建新会话"""
@@ -191,16 +252,24 @@ async def health_check():
 
 # ==================== 登录认证API ====================
 
-async def _check_qrcode_background(qr_id: str, code: str, cookies: Dict[str, str]):
-    """后台任务：持续检测二维码状态，直到确认扫描结果"""
+async def _check_qrcode_background(qr_id: str, code: str, cookies: Dict[str, str], session_name: Optional[str] = None):
+    """后台任务：持续检测二维码状态，直到确认扫描结果
+    
+    Args:
+        qr_id: 二维码ID
+        code: 二维码code
+        cookies: 初始cookies
+        session_name: 自定义会话名，如果不指定则使用用户ID
+    """
     session_manager.qrcode_results[qr_id] = {"status": "pending", "result": None, "done": False}
     try:
         # 持续检测直到有结果（最多检测120次，间隔5秒，共10分钟）
         for _ in range(120):
-            await asyncio.sleep(5)
+            await asyncio.sleep(2)
             success, msg, updated_cookies = session_manager.pc_login_api.check_qrcode_status(
                 qr_id, code, cookies
             )
+            print(f"后台检测二维码状态: {msg}")
 
             if success and msg == "二维码已扫描，请确认登录":
                 session_manager.qrcode_results[qr_id] = {
@@ -221,6 +290,22 @@ async def _check_qrcode_background(qr_id: str, code: str, cookies: Dict[str, str
                     },
                     "done": True
                 }
+                # 确定会话名：优先使用自定义名称，否则使用用户ID，最后使用qr_id
+                final_session_name = session_name
+                if not final_session_name and user_success and user_info:
+                    final_session_name = f"user_{user_info.get('user_id', qr_id)}"
+                if not final_session_name:
+                    final_session_name = f"pc_{qr_id}"
+                
+                # 保存cookie到文件
+                session_manager.save_session_cookie(
+                    session_name=final_session_name,
+                    cookies=final_cookies,
+                    cookies_str=cookies_str,
+                    user_info=user_info if user_success else None
+                )
+                # 在结果中记录使用的会话名
+                session_manager.qrcode_results[qr_id]["result"]["session_name"] = final_session_name
                 break
             elif msg == "二维码已失效":
                 session_manager.qrcode_results[qr_id] = {
@@ -240,23 +325,40 @@ async def _check_qrcode_background(qr_id: str, code: str, cookies: Dict[str, str
         }
 
 @app.post("/auth/qrcode/init", response_model=ResponseModel)
-async def init_qrcode_login(background_tasks: BackgroundTasks):
+async def init_qrcode_login(request: QRCodeInitRequest, background_tasks: BackgroundTasks):
     """
     初始化二维码登录
     生成初始cookies和二维码，启动后台检测
     """
     try:
+        # 调试输出
+        print("=" * 50)
+        print(f"[调试] 初始化二维码登录")
+        print(f"[调试] session_name: {request.session_name}")
+        print("=" * 50)
+        
         # 生成初始cookies
         cookies = session_manager.pc_login_api.generate_init_cookies()
+        print(f"[调试] 生成初始cookies成功，keys: {list(cookies.keys())}")
 
         # 生成二维码
         success, msg, qr_data = session_manager.pc_login_api.generate_qrcode(cookies)
+        print(f"[调试] 生成二维码: success={success}, msg={msg}")
 
         if success:
             qr_id = qr_data["qr_id"]
             code = qr_data["code"]
+            print(f"[调试] qr_id: {qr_id}, code: {code}")
+            print(f"[调试] qr_url: {qr_data['qr_url']}")
+            
+            # 保存 session_name 到 qr_id 的映射
+            if request.session_name:
+                session_manager.session_qr_map[request.session_name] = qr_id
+                print(f"[调试] 已建立映射: {request.session_name} -> {qr_id}")
+            
             # 启动后台任务检测二维码状态
-            background_tasks.add_task(_check_qrcode_background, qr_id, code, qr_data["cookies"])
+            background_tasks.add_task(_check_qrcode_background, qr_id, code, qr_data["cookies"], request.session_name)
+            print(f"[调试] 后台检测任务已启动")
 
             return ResponseModel(
                 success=True,
@@ -265,16 +367,21 @@ async def init_qrcode_login(background_tasks: BackgroundTasks):
                     "qr_id": qr_id,
                     "code": code,
                     "qr_url": qr_data["qr_url"],
-                    "cookies": qr_data["cookies"]
+                    "cookies": qr_data["cookies"],
+                    "session_name": request.session_name
                 }
             )
         else:
+            print(f"[调试] 二维码生成失败: {msg}")
             return ResponseModel(
                 success=False,
                 message=f"二维码生成失败: {msg}",
                 data=None
             )
     except Exception as e:
+        print(f"[调试] 异常: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return ResponseModel(
             success=False,
             message=f"初始化二维码登录失败: {str(e)}",
@@ -282,21 +389,37 @@ async def init_qrcode_login(background_tasks: BackgroundTasks):
         )
 
 @app.post("/auth/qrcode/check", response_model=ResponseModel)
-async def check_qrcode_status(
-    qr_id: str,
-    code: str,
-    cookies: Dict[str, str]
-):
+async def check_qrcode_status(request: QRCodeCheckRequest):
     """
-    检查二维码扫描状态（从后台检测结果获取）
+    检查二维码扫描状态（通过session_name查询）
     """
     try:
-        # 优先从后台检测结果获取
+        session_name = request.session_name
+        
+        # 调试输出
+        print(f"[调试] 检查二维码状态: session_name={session_name}")
+        
+        # 通过 session_name 获取 qr_id
+        qr_id = session_manager.session_qr_map.get(session_name)
+        if not qr_id:
+            print(f"[调试] 未找到 session_name 对应的 qr_id")
+            return ResponseModel(
+                success=False,
+                message=f"未找到会话 {session_name} 对应的二维码，请先调用 /auth/qrcode/init",
+                data=None
+            )
+        
+        print(f"[调试] 找到 qr_id: {qr_id}")
+        
+        # 从后台检测结果获取
         if qr_id in session_manager.qrcode_results:
             result = session_manager.qrcode_results[qr_id]
+            print(f"[调试] 后台检测结果: status={result['status']}, done={result['done']}")
+            
             if result["done"]:
                 status = result["status"]
                 if status == "confirmed":
+                    print(f"[调试] 登录成功，session_name={result['result'].get('session_name')}")
                     return ResponseModel(
                         success=True,
                         message="登录成功",
@@ -321,31 +444,17 @@ async def check_qrcode_status(
                     message=result["status"],
                     data=result["result"]
                 )
-
-        # 如果没有后台结果，直接检查（兼容旧逻辑）
-        success, msg, updated_cookies = session_manager.pc_login_api.check_qrcode_status(
-            qr_id, code, cookies
-        )
-
-        result_data = {
-            "status": msg,
-            "cookies": updated_cookies
-        }
-
-        # 如果登录成功，获取用户信息
-        if success:
-            user_success, user_info, final_cookies = session_manager.pc_login_api.get_user_info(updated_cookies)
-            if user_success:
-                result_data["user_info"] = user_info
-                result_data["cookies"] = final_cookies
-                result_data["cookies_str"] = session_manager.pc_login_api.cookies_to_str(final_cookies)
-
+        
+        # 没有找到检测结果
         return ResponseModel(
-            success=success,
-            message=msg,
-            data=result_data
+            success=False,
+            message="未找到二维码检测结果，请稍后重试",
+            data=None
         )
     except Exception as e:
+        print(f"[调试] 检查二维码状态异常: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return ResponseModel(
             success=False,
             message=f"检查二维码状态失败: {str(e)}",
@@ -422,6 +531,75 @@ async def phone_login(
             message=f"手机登录失败: {str(e)}",
             data=None
         )
+
+# ==================== Cookie管理API ====================
+
+@app.get("/cookie/sessions", response_model=ResponseModel)
+async def list_cookie_sessions():
+    """
+    列出所有已保存的cookie会话
+    """
+    sessions = session_manager.list_saved_sessions()
+    return ResponseModel(
+        success=True,
+        message=f"共有 {len(sessions)} 个已保存的会话",
+        data={"sessions": sessions}
+    )
+
+@app.get("/cookie/get/{session_name}", response_model=ResponseModel)
+async def get_saved_cookie(session_name: str):
+    """
+    获取指定会话的cookie
+    """
+    cookie_data = session_manager.get_session_cookie(session_name)
+    if cookie_data:
+        return ResponseModel(
+            success=True,
+            message="获取cookie成功",
+            data=cookie_data
+        )
+    else:
+        return ResponseModel(
+            success=False,
+            message=f"未找到会话: {session_name}",
+            data=None
+        )
+
+@app.delete("/cookie/delete/{session_name}", response_model=ResponseModel)
+async def delete_saved_cookie(session_name: str):
+    """
+    删除指定会话的cookie
+    """
+    if session_name in session_manager.saved_cookies:
+        session_manager.delete_session_cookie(session_name)
+        return ResponseModel(
+            success=True,
+            message=f"已删除会话: {session_name}",
+            data=None
+        )
+    else:
+        return ResponseModel(
+            success=False,
+            message=f"未找到会话: {session_name}",
+            data=None
+        )
+
+@app.post("/cookie/save/{session_name}", response_model=ResponseModel)
+async def save_cookie_manually(
+    session_name: str,
+    cookies: Dict[str, str],
+    cookies_str: str,
+    user_info: Optional[Dict[str, Any]] = None
+):
+    """
+    手动保存cookie
+    """
+    session_manager.save_session_cookie(session_name, cookies, cookies_str, user_info)
+    return ResponseModel(
+        success=True,
+        message=f"Cookie已保存到会话: {session_name}",
+        data=None
+    )
 
 # ==================== 数据爬取API ====================
 

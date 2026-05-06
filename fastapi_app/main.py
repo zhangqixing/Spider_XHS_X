@@ -271,13 +271,13 @@ async def _check_qrcode_background(qr_id: str, code: str, cookies: Dict[str, str
             )
             print(f"后台检测二维码状态: {msg}")
 
-            if success and msg == "二维码已扫描，请确认登录":
+            if success and msg == "请确认登录":
                 session_manager.qrcode_results[qr_id] = {
                     "status": "scanned",
                     "result": {"cookies": updated_cookies},
                     "done": False
                 }
-            elif success and msg == "二维码已确认，请稍后":
+            elif success and msg == "验证成功":
                 # 登录成功
                 user_success, user_info, final_cookies = session_manager.pc_login_api.get_user_info(updated_cookies)
                 cookies_str = session_manager.pc_login_api.cookies_to_str(final_cookies)
@@ -307,14 +307,14 @@ async def _check_qrcode_background(qr_id: str, code: str, cookies: Dict[str, str
                 # 在结果中记录使用的会话名
                 session_manager.qrcode_results[qr_id]["result"]["session_name"] = final_session_name
                 break
-            elif msg == "二维码已失效":
+            elif msg == "二维码已过期":
                 session_manager.qrcode_results[qr_id] = {
                     "status": "expired",
                     "result": None,
                     "done": True
                 }
                 break
-            elif msg == "二维码未失效，请继续等待":
+            elif msg == "请扫描二维码":
                 # 继续等待
                 continue
     except Exception as e:
